@@ -2,16 +2,15 @@ pipeline {
     agent any
 
     tools {
-        maven 'Maven'   // Doit être configuré dans Jenkins (Manage Jenkins > Tools)
+        maven 'Maven'
     }
 
     environment {
         TRIVY_TIMEOUT = "10m"
+        TRIVY_STATUS  = 'OK'
     }
 
     triggers {
-        // Se déclenche automatiquement quand tu push sur GitHub
-        // (nécessite le webhook GitHub configuré — voir instructions plus bas)
         githubPush()
     }
 
@@ -22,14 +21,20 @@ pipeline {
         // ===========================
         stage('Clone Repository') {
             steps {
-                cleanWs()
-                git branch: 'main',
-                    url: 'https://github.com/amenbhs/FINALBACKENDPFE-V1'
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/main']],
+                    extensions: [
+                        [$class: 'CloneOption', timeout: 60, shallow: true, depth: 1],
+                        [$class: 'CleanBeforeCheckout']
+                    ],
+                    userRemoteConfigs: [[url: 'https://github.com/amenbhs/FINALBACKENDPFE-V1']]
+                ])
             }
         }
 
         // ===========================
-        // 2. BUILD MAVEN (compile le projet)
+        // 2. BUILD MAVEN
         // ===========================
         stage('Build Project') {
             steps {
@@ -58,22 +63,32 @@ pipeline {
         stage('Dependency Check') {
             steps {
                 bat 'mvn dependency:tree'
-                bat 'mvn versions:display-dependency-updates'
             }
         }
 
         // ===========================
-        // 5. TRIVY - SCAN DE SÉCURITÉ (échoue si CRITICAL)
+        // 5. TRIVY - SCAN DE SÉCURITÉ (ne bloque PAS le pipeline)
         // ===========================
-        stage('Trivy Scan - Fail on Critical') {
+        stage('Trivy Scan - Check Critical') {
             steps {
-                bat """
-                trivy fs . ^
-                --scanners vuln ^
-                --severity CRITICAL ^
-                --timeout %TRIVY_TIMEOUT% ^
-                --exit-code 1
-                """
+                script {
+                    def scanResult = bat(
+                        script: """
+                        trivy fs . ^
+                        --scanners vuln ^
+                        --severity CRITICAL ^
+                        --timeout %TRIVY_TIMEOUT% ^
+                        --exit-code 1
+                        """,
+                        returnStatus: true
+                    )
+                    if (scanResult != 0) {
+                        echo '⚠️ Vulnérabilités CRITICAL détectées !'
+                        env.TRIVY_STATUS = 'CRITICAL_FOUND'
+                    } else {
+                        echo '✅ Aucune vulnérabilité CRITICAL détectée'
+                    }
+                }
             }
         }
 
@@ -87,7 +102,7 @@ pipeline {
         }
 
         // ===========================
-        // 7. TRIVY - GÉNÉRER LE RAPPORT HTML
+        // 7. TRIVY - GÉNÉRER LE RAPPORT HTML (TOUJOURS)
         // ===========================
         stage('Generate Trivy HTML Report') {
             steps {
@@ -103,12 +118,25 @@ pipeline {
         }
 
         // ===========================
-        // 8. ARCHIVER LES RÉSULTATS
+        // 8. ARCHIVER LES RÉSULTATS (TOUJOURS)
         // ===========================
         stage('Archive Reports') {
             steps {
                 archiveArtifacts artifacts: 'trivy-report.html', fingerprint: true
                 archiveArtifacts artifacts: 'target/*.jar', fingerprint: true, allowEmptyArchive: true
+            }
+        }
+
+        // ===========================
+        // 9. VÉRIFIER LE RÉSULTAT TRIVY
+        // ===========================
+        stage('Security Gate') {
+            steps {
+                script {
+                    if (env.TRIVY_STATUS == 'CRITICAL_FOUND') {
+                        error '❌ Pipeline échoué : Vulnérabilités CRITICAL détectées ! Consultez trivy-report.html'
+                    }
+                }
             }
         }
     }
@@ -125,7 +153,7 @@ pipeline {
         failure {
             echo '============================================'
             echo '❌ PIPELINE ÉCHOUÉ'
-            echo '❌ Vulnérabilités CRITICAL détectées ou tests échoués'
+            echo '📄 Le rapport Trivy est quand même disponible dans Build Artifacts'
             echo '============================================'
         }
         always {
